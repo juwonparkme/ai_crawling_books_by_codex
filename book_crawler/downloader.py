@@ -20,6 +20,15 @@ def build_pdf_filename(title: Optional[str], author: Optional[str], year: Option
     return f"{base}.pdf"
 
 
+def _probe_content_type(url: str, timeout: float) -> Optional[str]:
+    req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            return response.info().get_content_type()
+    except Exception:
+        return None
+
+
 def download_pdf(url: str, out_dir: Path, filename: str, timeout: float) -> Tuple[Optional[Path], dict]:
     out_dir.mkdir(parents=True, exist_ok=True)
     target = out_dir / filename
@@ -33,6 +42,13 @@ def download_pdf(url: str, out_dir: Path, filename: str, timeout: float) -> Tupl
                 target = candidate
                 break
             index += 1
+
+    content_type = _probe_content_type(url, timeout)
+    if content_type is not None and content_type != "application/pdf":
+        return None, {
+            "status": "skipped",
+            "error": f"content_type_not_pdf:{content_type}",
+        }
 
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     try:

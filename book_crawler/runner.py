@@ -76,7 +76,7 @@ def run(config: CrawlerConfig) -> Path:
             if not payload_result:
                 continue
 
-            candidates = payload_result.get("candidates", [])
+            candidates = _prioritize_candidates(payload_result.get("candidates", []))
             decision = payload_result.get("decision", {})
             allowed = decision.get("status") == "allowed"
             selected_url = candidates[0]["url"] if candidates else None
@@ -136,3 +136,29 @@ def run(config: CrawlerConfig) -> Path:
         driver.quit()
 
     return write_run_json(config.out_dir, payload)
+
+
+def _prioritize_candidates(candidates: List[dict]) -> List[dict]:
+    seen = set()
+    ordered: List[dict] = []
+
+    def score(url: str) -> int:
+        url_lower = url.lower()
+        if url_lower.endswith(".pdf"):
+            return 0
+        if ".pdf" in url_lower:
+            return 1
+        return 2
+
+    for candidate in candidates:
+        url = candidate.get("url")
+        if not url:
+            continue
+        key = url.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(candidate)
+
+    ordered.sort(key=lambda item: score(item["url"]))
+    return ordered
