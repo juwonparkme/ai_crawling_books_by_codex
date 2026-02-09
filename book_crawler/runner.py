@@ -9,6 +9,7 @@ from typing import List
 
 from .config import CrawlerConfig
 from .crawler import analyze_result, collect_search_results, create_driver
+from .downloader import build_pdf_filename, download_pdf
 
 
 def build_queries(config: CrawlerConfig) -> List[str]:
@@ -72,14 +73,65 @@ def run(config: CrawlerConfig) -> Path:
         all_results = all_results[: config.max_results]
         for result in all_results:
             payload_result = analyze_result(driver, config, result)
-            if payload_result:
-                payload["results"].append(payload_result)
+            if not payload_result:
+                continue
+
+            candidates = payload_result.get("candidates", [])
+            decision = payload_result.get("decision", {})
+            allowed = decision.get("status") == "allowed"
+            selected_url = candidates[0]["url"] if candidates else None
+            if selected_url:
+                decision["selected_url"] = selected_url
+
+            if allowed and selected_url and not config.dry_run:
+                book = payload_result.get("book", {})
+                filename = build_pdf_filename(
+                    book.get("title"),
+                    book.get("author"),
+                    book.get("year"),
+                )
+                path, info = download_pdf(selected_url, config.out_dir, filename, config.timeout)
+                if path:
+                    payload_result["downloads"].append(
+                        {
+                            "path": str(path),
+                            "size_bytes": info.get("size_bytes"),
+                            "sha256": info.get("sha256"),
+                            "status": info.get("status"),
+                            "error": info.get("error"),
+                        }
+                    )
+                    payload["stats"]["downloaded"] += 1
+                else:
+                    payload_result["downloads"].append(
+                        {
+                            "path": None,
+                            "size_bytes": None,
+                            "sha256": None,
+                            "status": info.get("status"),
+                            "error": info.get("error"),
+                        }
+                    )
+                    payload["stats"]["failed"] += 1
+            else:
+                if selected_url:
+                    payload_result["downloads"].append(
+                        {
+                            "path": None,
+                            "size_bytes": None,
+                            "sha256": None,
+                            "status": "skipped",
+                            "error": "dry_run_or_not_allowed",
+                        }
+                    )
+                payload["stats"]["skipped"] += 1
+
+            payload["results"].append(payload_result)
 
         payload["stats"]["total_results"] = len(payload["results"])
         payload["stats"]["total_candidates"] = sum(
             len(item.get("candidates", [])) for item in payload["results"]
         )
-        payload["stats"]["skipped"] = payload["stats"]["total_candidates"]
     finally:
         driver.quit()
 
