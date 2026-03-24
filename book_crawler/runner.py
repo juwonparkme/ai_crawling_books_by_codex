@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import List
 
 from .config import CrawlerConfig
-from .crawler import analyze_result, collect_search_results, create_driver
+from .crawler import SearchResult, analyze_result, collect_search_results, create_driver
 from .downloader import build_pdf_filename, download_pdf
 
 
@@ -75,10 +75,8 @@ def run(config: CrawlerConfig) -> Path:
         for query in queries:
             results = collect_search_results(driver, config, query)
             all_results.extend(results)
-            if len(all_results) >= config.max_results:
-                break
 
-        all_results = all_results[: config.max_results]
+        all_results = _prioritize_search_results(all_results, config.max_results)
         for result in all_results:
             payload_result = analyze_result(driver, config, result)
             if not payload_result:
@@ -170,3 +168,17 @@ def _prioritize_candidates(candidates: List[dict]) -> List[dict]:
 
     ordered.sort(key=lambda item: score(item["url"]))
     return ordered
+
+
+def _prioritize_search_results(results: List[SearchResult], limit: int) -> List[SearchResult]:
+    best_by_url: dict[str, SearchResult] = {}
+    for result in results:
+        key = result.url.lower()
+        current = best_by_url.get(key)
+        if current is None or result.relevance_score > current.relevance_score:
+            best_by_url[key] = result
+
+    ordered = sorted(best_by_url.values(), key=lambda item: (-item.relevance_score, item.rank))
+    for index, result in enumerate(ordered, start=1):
+        result.rank = index
+    return ordered[:limit]

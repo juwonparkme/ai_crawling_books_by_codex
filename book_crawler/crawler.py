@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 import time
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List
 
 import importlib
@@ -13,6 +13,7 @@ import re
 
 from .config import CrawlerConfig
 from .license_detector import decision_for, merge_text_parts
+from .search_ranker import is_supported_search_language, score_search_result
 
 
 class SearchEngineBlockedError(RuntimeError):
@@ -26,6 +27,8 @@ class SearchResult:
     url: str
     domain: str
     snippet: str
+    relevance_score: int = 0
+    relevance_reasons: List[str] = field(default_factory=list)
 
 
 def build_search_url(query: str, lang: str) -> str:
@@ -115,6 +118,30 @@ def _has_search_results(driver) -> bool:
     return False
 
 
+def _has_no_results(driver) -> bool:
+    by_module = importlib.import_module("selenium.webdriver.common.by")
+    By = by_module.By
+    selectors = (
+        ".b_no",
+        "#b_results .b_no",
+    )
+    for selector in selectors:
+        try:
+            if driver.find_elements(By.CSS_SELECTOR, selector):
+                return True
+        except Exception:
+            continue
+
+    text = _page_text(driver)
+    markers = (
+        "there are no results for",
+        "do not contain the terms",
+        "검색 결과가 없습니다",
+        "포함한 결과 없음",
+    )
+    return any(marker in text for marker in markers)
+
+
 def collect_search_results(driver, config: CrawlerConfig, query: str) -> List[SearchResult]:
     by_module = importlib.import_module("selenium.webdriver.common.by")
     ec_module = importlib.import_module("selenium.webdriver.support.expected_conditions")
@@ -137,13 +164,20 @@ def collect_search_results(driver, config: CrawlerConfig, query: str) -> List[Se
 
     try:
         WebDriverWait(driver, config.timeout).until(
-            lambda current_driver: _search_block_reason(current_driver) or _has_search_results(current_driver)
+            lambda current_driver: (
+                _search_block_reason(current_driver)
+                or _has_search_results(current_driver)
+                or _has_no_results(current_driver)
+            )
         )
     except TimeoutException as exc:
         block_reason = _search_block_reason(driver)
         if block_reason:
             raise SearchEngineBlockedError(f"{block_reason}: {driver.current_url}") from exc
-        raise
+        return []
+
+    if _has_no_results(driver):
+        return []
 
     blocks = driver.find_elements(By.CSS_SELECTOR, "li.b_algo")
     results: List[SearchResult] = []
@@ -151,33 +185,46 @@ def collect_search_results(driver, config: CrawlerConfig, query: str) -> List[Se
     for block in blocks:
         try:
             link_el = block.find_element(By.CSS_SELECTOR, "h2 a")
+            title = _element_text(link_el)
+            url = _extract_result_url(link_el.get_attribute("href") or "")
+            if not title or not url:
+                continue
+
+            snippet = ""
+            snippet_els = block.find_elements(By.CSS_SELECTOR, ".b_caption p")
+            if snippet_els:
+                snippet = _element_text(snippet_els[0])
+
+            allowed_language, language_reason = is_supported_search_language(title, snippet)
+            if not allowed_language:
+                continue
+
+            domain = urllib.parse.urlparse(url).netloc
+            results.append(
+                SearchResult(
+                    rank=len(results) + 1,
+                    title=title,
+                    url=url,
+                    domain=domain,
+                    snippet=snippet,
+                )
+            )
         except Exception:
             continue
 
-        title = _element_text(link_el)
-        url = _extract_result_url(link_el.get_attribute("href") or "")
-        if not title or not url:
-            continue
-
-        snippet = ""
-        snippet_els = block.find_elements(By.CSS_SELECTOR, ".b_caption p")
-        if snippet_els:
-            snippet = _element_text(snippet_els[0])
-
-        domain = urllib.parse.urlparse(url).netloc
-        results.append(
-            SearchResult(
-                rank=len(results) + 1,
-                title=title,
-                url=url,
-                domain=domain,
-                snippet=snippet,
-            )
+    for result in results:
+        result.relevance_score, result.relevance_reasons = score_search_result(
+            config.title,
+            config.author,
+            result.title,
+            result.url,
+            result.snippet,
+            result.domain,
         )
 
-        if len(results) >= config.max_results:
-            break
-
+    results.sort(key=lambda item: (-item.relevance_score, item.rank))
+    for index, result in enumerate(results, start=1):
+        result.rank = index
     return results
 
 
@@ -403,6 +450,8 @@ def analyze_result(driver, config: CrawlerConfig, result: SearchResult) -> dict:
                     "url": result.url,
                     "domain": result.domain,
                     "snippet": result.snippet,
+                    "relevance_score": result.relevance_score,
+                    "relevance_reasons": result.relevance_reasons,
                 },
                 "book": metadata,
                 "candidates": [
@@ -430,6 +479,8 @@ def analyze_result(driver, config: CrawlerConfig, result: SearchResult) -> dict:
                         "url": result.url,
                         "domain": result.domain,
                         "snippet": result.snippet,
+                        "relevance_score": result.relevance_score,
+                        "relevance_reasons": result.relevance_reasons,
                     },
                     "book": {
                         "title": None,
